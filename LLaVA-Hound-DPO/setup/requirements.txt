@@ -1,0 +1,26 @@
+gpustat
+fire
+logzero
+transformers==4.36.2
+deepspeed==0.14.4
+tokenizers==0.15.0
+sentencepiece==0.1.99
+shortuuid
+accelerate==0.23.0
+peft==0.5.0
+bitsandbytes==0.45.5
+scikit-learn==1.2.2
+einops==0.6.1
+einops-exts==0.0.4
+timm==0.6.13
+openai==1.4.0
+decord==0.6.0
+matplotlib
+pytorchvideo==0.1.5
+tyro==0.9.19
+transformers_stream_generator
+tiktoken
+opencv-python
+multiprocess==0.70.16
+wget https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiTRUE-cp312-cp312-linux_x86_64.whl --no-check-certificate
+pip install flash_attn-*.whl --no-build-isolation

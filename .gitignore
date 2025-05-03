@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.jpeg
+*.jpg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.ico
+*.mp4
