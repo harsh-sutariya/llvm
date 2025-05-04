@@ -23,7 +23,7 @@ python3 ./my_eval.py \
     --top_p 0.7 \
     --temperature 0.2 \
     --answers_file ${output_file} \
-    --adaptive_attention False \
+    --adaptive_attention True \
     --confidence_threshold_low 0.3 \
     --confidence_threshold_high 0.7 \
     --alpha_low 0.5 \

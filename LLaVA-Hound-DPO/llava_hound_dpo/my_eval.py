@@ -344,42 +344,55 @@ class AdaptVisAttentionScaling:
         # Store the original attention function
         self.original_attention_forward = None
         self.hooked = False
+        self.image_token_start = None
+        self.image_token_end = None
         
     def get_attention_scaling_hook(self):
         """Create a hook function to modify cross-attention based on token confidence"""
         def attention_scaling_hook(module, inputs, outputs):
             # This hook will be called during the forward pass of the attention module
-            # We only modify the cross-attention to image tokens
+            # We modify the cross-attention between the *last* text token and image tokens
             
             # Get attention weights (query x key) before softmax
-            attention_weights = outputs[1]  # Assuming this is the attention matrix
+            attention_weights = outputs[1]  # [batch_size, num_heads, seq_len, seq_len]
             
-            # Apply confidence-based scaling
-            if hasattr(self, 'current_confidence') and self.current_confidence is not None:
-                # Determine scaling factor based on confidence
-                if self.current_confidence < self.confidence_threshold_low:
-                    alpha = self.alpha_low  # Smooth attention (spread it out more)
-                elif self.current_confidence > self.confidence_threshold_high:
-                    alpha = self.alpha_high  # Sharpen attention (focus more)
-                else:
-                    alpha = 1.0  # No change
+            # Use the fixed alpha determined after the first generation step
+            if hasattr(self, 'fixed_alpha_for_generation'):
+                alpha = self.fixed_alpha_for_generation
                 
-                # Scale the attention logits
-                # We identify which tokens are image tokens and only scale those
-                # For simplicity, assuming image tokens are in a specific range
-                # This would need to be adapted to the specific model implementation
-                
-                # Apply the scaling
-                if alpha != 1.0:
-                    # Here we scale the attention to image tokens
-                    # In a real implementation, you'd need to identify which tokens are image tokens
-                    # and only scale those parts of the attention matrix
-                    scaled_attention = attention_weights * alpha
+                # Apply the scaling only to the last token's attention to image tokens
+                if alpha != 1.0 and self.image_token_start is not None and self.image_token_end is not None:
+                    # Check if we are in the generation phase (seq_len > initial_len)
+                    # This hook runs on every forward pass, including the first one where alpha should be 1.0
+                    # We rely on fixed_alpha_for_generation being set *after* the first pass.
+                    # A potentially cleaner way might involve checking past_key_values length.
+                    
+                    scaled_attention = attention_weights.clone()
+                    scaled_attention[:, :, -1, self.image_token_start:self.image_token_end] *= alpha
                     return (outputs[0], scaled_attention) + outputs[2:]
             
+            # If fixed_alpha_for_generation is not set (e.g., first step), or alpha is 1.0, return original
             return outputs
         
         return attention_scaling_hook
+    
+    def find_image_token_positions(self, input_ids):
+        """Find the start and end positions of image tokens in the sequence"""
+        # In LLaVA, image tokens are marked with IMAGE_TOKEN_INDEX (-200)
+        # The image tokens are inserted where the <image> token was in the prompt
+        image_token_id = -200  # LLaVA's IMAGE_TOKEN_INDEX
+        
+        # Find where the image tokens are
+        image_token_pos = (input_ids == image_token_id).nonzero()
+        if len(image_token_pos) > 0:
+            # The image token position marks where the image patches start
+            self.image_token_start = image_token_pos[0].item()
+            # Each image has 256 patch tokens following the image token
+            self.image_token_end = self.image_token_start + 257  # Include the image token itself
+        else:
+            print("No image tokens found in input")
+            self.image_token_start = None
+            self.image_token_end = None
     
     def hook_model(self):
         """Add hooks to the model's attention modules"""
@@ -414,74 +427,94 @@ class AdaptVisAttentionScaling:
         self.hooked = False
         
     def generate_with_adaptive_attention(self, *args, **kwargs):
-        """Wrapper around the model's generate method that implements adaptive attention scaling"""
+        """Wrapper around the model's generate method that implements adaptive attention scaling
+           following the original AdaptVis strategy (fixed alpha after first token).
+        """
         self.hook_model()
         
-        # Custom generation logic with confidence-based attention scaling
         input_ids = kwargs.get("input_ids")
-        
-        # Get the image input if available
         images = kwargs.get("images", None)
+        max_new_tokens = kwargs.get("max_new_tokens", 20)
+        eos_token_id = kwargs.get("eos_token_id")
         
-        # Initial tokens - we'll build this incrementally
-        generated_ids = input_ids.clone()
+        # Find image token positions at the start
+        self.find_image_token_positions(input_ids[0])
         
-        # Track max sequence length
-        max_length = kwargs.get("max_new_tokens", 20) + input_ids.shape[1]
+        # --- Step 1: Generate the first token without scaling --- 
+        self.current_confidence = None # Ensure no scaling for the first token
+        alpha = 1.0 # Explicitly set alpha to 1 for the first step
         
-        # Loop for generating tokens
         with torch.inference_mode():
-            for i in range(max_length - input_ids.shape[1]):
-                # Forward pass to get logits
+            outputs = self.model(
+                input_ids=input_ids,
+                images=images,
+                use_cache=True, # Use cache for subsequent steps
+                return_dict=True
+            )
+            
+            next_token_logits = outputs.logits[:, -1, :]
+            past_key_values = outputs.past_key_values
+            
+            # Sample the first token (greedy for simplicity here, adapt if using sampling)
+            first_next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            generated_ids = torch.cat([input_ids, first_next_token], dim=-1)
+
+            # --- Step 2: Calculate confidence based on the first token --- 
+            probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
+            first_token_confidence = torch.max(probs, dim=-1)[0].item()
+            print(f"First token confidence: {first_token_confidence:.3f}")
+
+            # --- Step 3: Determine the fixed scaling factor for the rest --- 
+            if first_token_confidence < self.confidence_threshold_low:
+                fixed_alpha = self.alpha_low
+                print(f"Using fixed alpha_low: {fixed_alpha}")
+            elif first_token_confidence > self.confidence_threshold_high:
+                fixed_alpha = self.alpha_high
+                print(f"Using fixed alpha_high: {fixed_alpha}")
+            else:
+                fixed_alpha = 1.0
+                print(f"Using fixed alpha: {fixed_alpha} (moderate confidence)")
+            
+            # Set the fixed alpha for the hook to use in subsequent steps
+            self.current_confidence = first_token_confidence # Store confidence for hook
+            # The hook will use the fixed_alpha derived from this confidence
+            # Need to modify hook slightly or pass fixed_alpha explicitly
+            self.fixed_alpha_for_generation = fixed_alpha
+
+            # --- Step 4: Generate remaining tokens with the fixed scaling factor --- 
+            current_token_ids = first_next_token
+            
+            for i in range(1, max_new_tokens): # Start from 1 since we already generated the first token
+                # Prepare inputs for the next step using cache
+                model_inputs = self.model.prepare_inputs_for_generation(current_token_ids, past_key_values=past_key_values)
+                
+                # Forward pass with the fixed alpha applied by the hook
                 outputs = self.model(
-                    input_ids=generated_ids,
-                    images=images,
-                    return_dict=True
+                    **model_inputs,
+                    images=images, # Must pass images even with cache if hook needs them?
+                    return_dict=True,
+                    use_cache=True,
+                    output_attentions=False, # Avoid storing attentions unless needed
+                    output_hidden_states=False
                 )
                 
-                
                 next_token_logits = outputs.logits[:, -1, :]
-                # Calculate confidence as probability of most likely token
-                probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
-                confidence = torch.max(probs, dim=-1)[0].item()
-                # Store confidence for the attention scaling hook
-                self.current_confidence = confidence
+                past_key_values = outputs.past_key_values # Update cache
                 
-                # Sample next token
-                if kwargs.get("do_sample", False) and kwargs.get("temperature", 0) > 0:
-                    # Temperature sampling
-                    temperature = kwargs.get("temperature", 1.0)
-                    next_token_logits = next_token_logits / temperature
-                    
-                    # Get top_p and handle None case
-                    top_p = kwargs.get("top_p", 1.0)
-                    if top_p is not None and top_p < 1.0:
-                        # Top-p (nucleus) sampling
-                        sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                        cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
-                        sorted_indices_to_remove = cumulative_probs > top_p
-                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                        sorted_indices_to_remove[..., 0] = 0
-                        indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                        next_token_logits[:, indices_to_remove] = -float('inf')
-                    
-                    probs = torch.nn.functional.softmax(next_token_logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-                else:
-                    # Greedy decoding
-                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                # Sample next token (greedy)
+                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
                 
                 # Append to generated sequence
                 generated_ids = torch.cat([generated_ids, next_token], dim=-1)
+                current_token_ids = next_token # Next input is just the new token
                 
-                # Check if we've hit the end token
-                if kwargs.get("eos_token_id") is not None:
-                    if (next_token == kwargs.get("eos_token_id")).all():
-                        break
+                # Check for EOS
+                if eos_token_id is not None and (next_token == eos_token_id).all():
+                    break
         
         self.unhook_model()
+        delattr(self, "fixed_alpha_for_generation") # Clean up
         
-        # Return generated tokens
         return generated_ids
 
 
